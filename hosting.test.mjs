@@ -26,3 +26,17 @@ test('unhealthy containers are not reported as recovered',async()=>{
  const {db}=setup();db.prepare('INSERT INTO bots VALUES(?,?,?,?,?,?,?,?)').run('reserved',owner,'Test',guild,'345678901234567890','existing-service','needs_attention',1);
  const host=createHosting({cfg,db,random:()=>'',now:()=>2,fetcher:async()=>new Response(JSON.stringify({applications:[{name:'bot',status:'running:unhealthy'}],databases:[{name:'mongo',status:'running:healthy'}]}))});await host.refresh(owner);assert.equal(host.list(owner)[0].status,'needs_attention');
 });
+
+test('queued stop remains stopping until Coolify observes exit',async()=>{
+ const {operationState}=await import('./hosting.mjs');const operation={action:'stop',requested:10,transition_seen:0};
+ assert.equal(operationState(operation,'running:healthy','running:healthy',11).status,'stopping');
+ assert.equal(operationState(operation,'exited:unhealthy','exited:unhealthy',20).status,'stopped');
+ assert.equal(operationState(operation,'running:healthy','running:healthy',131).status,'stop_unconfirmed');
+});
+test('queued restart cannot be confirmed by the old running snapshot',async()=>{
+ const {operationState}=await import('./hosting.mjs');const operation={action:'restart',requested:10,transition_seen:0};
+ assert.equal(operationState(operation,'running:healthy','running:healthy',11).confirmed,false);
+ assert.equal(operationState(operation,'exited:unhealthy','running:healthy',12).seen,true);
+ assert.equal(operationState({...operation,transition_seen:1},'running:healthy','running:healthy',20).confirmed,true);
+ assert.equal(operationState(operation,'running:healthy','running:healthy',131).status,'restart_unconfirmed');
+});

@@ -33,7 +33,7 @@ export function observedState(bot,mongo,previous){
  const running=status=>typeof status==='string'&&status.split(':')[0]==='running'&&!status.includes('unhealthy');
  if(running(bot)&&running(mongo)){
   // Stop/restart requests can be queued while Coolify still reports the old running container.
-  return previous==='stopped'?'stopped':'running';
+  return 'running';
  }
  if(bot.includes('unhealthy')||(typeof mongo==='string'&&mongo.includes('unhealthy')))return 'needs_attention';
  if(['exited','stopped'].includes(bot.split(':')[0])){
@@ -41,8 +41,18 @@ export function observedState(bot,mongo,previous){
  }
  return null;
 }
+export function operationState(operation,bot,mongo,time){
+ const running=status=>typeof status==='string'&&status.split(':')[0]==='running'&&!status.includes('unhealthy');
+ const stopped=typeof bot==='string'&&['stopped','exited'].includes(bot.split(':')[0]);
+ const seen=operation.transition_seen===1||(typeof bot==='string'&&!running(bot));
+ const confirmed=operation.action==='stop'?stopped:running(bot)&&running(mongo)&&(operation.action==='start'||seen);
+ if(confirmed)return{status:operation.action==='stop'?'stopped':'running',confirmed:true,seen};
+ const expired=time-operation.requested>=120;
+ return{status:expired?operation.action+'_unconfirmed':operation.action==='stop'?'stopping':operation.action==='start'?'starting':'restarting',confirmed:false,seen};
+}
 export function createHosting({cfg,db,random,now,fetcher=fetch}){
  db.exec(`CREATE TABLE IF NOT EXISTS bots(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,guild_id TEXT NOT NULL,discord_bot_id TEXT UNIQUE,service_uuid TEXT UNIQUE,state TEXT NOT NULL,created INTEGER NOT NULL);`);
+ db.exec('CREATE TABLE IF NOT EXISTS bot_operations(bot_id TEXT PRIMARY KEY REFERENCES bots(id),action TEXT NOT NULL,requested INTEGER NOT NULL,transition_seen INTEGER NOT NULL DEFAULT 0);');
  const q=(sql,...a)=>db.prepare(sql).get(...a),run=(sql,...a)=>db.prepare(sql).run(...a);
  function configured(){if(missingHosting(cfg).length)throw fail(503,'Hosting connection setup is incomplete.');}
  async function api(path,method='GET',data){
@@ -59,9 +69,17 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
    if(!b.service_uuid||b.state==='suspended')return;
    try{
     const service=await api('services/'+encodeURIComponent(b.service_uuid));
-    const bot=service.applications?.find(app=>app.name==='bot');
-    const mongo=service.databases?.find(database=>database.name==='mongo');
-    const current=observedState(bot?.status,mongo?.status,b.state);
+    const components=[...(service.applications||[]),...(service.databases||[])];
+    const bot=components.find(app=>app.name==='bot');
+    const mongo=components.find(database=>database.name==='mongo');
+    let current=observedState(bot?.status,mongo?.status,b.state);
+    const operation=q('SELECT * FROM bot_operations WHERE bot_id=?',b.id);
+    if(operation){
+     const result=operationState(operation,bot?.status,mongo?.status,now());
+     if(result.seen)run('UPDATE bot_operations SET transition_seen=1 WHERE bot_id=?',b.id);
+     current=result.status;
+     if(result.confirmed)run('DELETE FROM bot_operations WHERE bot_id=?',b.id);
+    }
     if(current&&current!==b.state)run('UPDATE bots SET state=? WHERE id=? AND user_id=?',current,b.id,user);
    }catch{ /* A provider outage must not invent a new status or release a reserved slot. */ }
   }));
@@ -110,7 +128,11 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
    if(!allowed)throw fail(403,'This bot has no active hosting slot.');
    if(['needs_attention','configuring'].includes(b.state))throw fail(409,'Contact support to complete this deployment before starting it.');
   }
-  await api('services/'+encodeURIComponent(b.service_uuid)+'/'+action,'POST');run('UPDATE bots SET state=? WHERE id=?',action==='stop'?'stopped':action==='start'?'starting':'restarting',id);return publicBot(owned(user,id));
+  const pending=q('SELECT * FROM bot_operations WHERE bot_id=?',id);
+  if(pending&&now()-pending.requested<120)throw fail(409,'An action is already queued. Wait for its status to update.');
+  await api('services/'+encodeURIComponent(b.service_uuid)+'/'+action,'POST');
+  run('INSERT INTO bot_operations VALUES(?,?,?,0) ON CONFLICT(bot_id) DO UPDATE SET action=excluded.action,requested=excluded.requested,transition_seen=0',id,action,now());
+  run('UPDATE bots SET state=? WHERE id=?',action==='stop'?'stopping':action==='start'?'starting':'restarting',id);return publicBot(owned(user,id));
  }
  async function enforce(user,slots){const bots=db.prepare('SELECT * FROM bots WHERE user_id=? ORDER BY created,id').all(user);for(const b of bots.slice(slots)){if(b.service_uuid&&!['suspended','stopped'].includes(b.state)){await api('services/'+encodeURIComponent(b.service_uuid)+'/stop','POST');run('UPDATE bots SET state=? WHERE id=?','suspended',b.id);}}}
  return{ready,list,check,create,control,enforce,refresh};

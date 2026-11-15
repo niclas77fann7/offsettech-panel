@@ -65,6 +65,9 @@ http.createServer(async(req,res)=>{try{const url=new URL(req.url,publicURL),p=ur
  if(req.method==='GET'&&p==='/api/account'){
   const s=session(req);if(!s)return send(res,200,{user:null,paymentsReady:!!cfg.STRIPE_SECRET_KEY});const slots=await locked(s.user_id,async()=>{const paid=await sync(s);if(hosting.ready())await hosting.enforce(s.user_id,slotAllowance(s.user_id,paid.total));await hosting.refresh(s.user_id);return paid;});return send(res,200,{user:{id:s.user_id,name:s.username},csrf:s.csrf,slots,paymentsReady:!!(cfg.STRIPE_SECRET_KEY&&cfg.STRIPE_WEBHOOK_SECRET),deploymentReady:hosting.ready(),commerceEnabled:cfg.COMMERCE_ENABLED==='true',hostingMissing:missingHosting(cfg),bots:hosting.list(s.user_id),hostingTest:cfg.COMMERCE_ENABLED!=='true'&&cfg.HOSTING_TEST_DISCORD_ID===s.user_id});
  }
+ if(req.method==='GET'&&p==='/api/bots/status'){
+  const s=requireSession(req);limit(req,s);return await locked(s.user_id,async()=>{await hosting.refresh(s.user_id);return send(res,200,{bots:hosting.list(s.user_id)});});
+ }
  if(req.method==='POST'&&p==='/api/logout'){const s=requireSession(req);csrf(req,s);run('DELETE FROM sessions WHERE id=?',s.id);return send(res,200,{ok:true},{'Set-Cookie':'__Host-offset_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'});}
  if(req.method==='POST'&&p==='/api/checkout'){
   const s=requireSession(req);csrf(req,s);limit(req,s);if(cfg.COMMERCE_ENABLED!=='true'||!hosting.ready())return send(res,503,{error:'Checkout is not open while hosting is being connected.'});need('STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_MONTHLY_PRICE_ID','STRIPE_YEARLY_PRICE_ID');const input=JSON.parse(await body(req));
