@@ -66,7 +66,8 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
    if(cfg.COOLIFY_DESTINATION_UUID)args.destination_uuid=cfg.COOLIFY_DESTINATION_UUID;
    externalAttempted=true;const created=await api('services','POST',args);if(!created.uuid)throw fail(502,'Coolify returned no service ID; contact support before retrying.');
    run('UPDATE bots SET service_uuid=?,state=? WHERE id=?',created.uuid,'configuring',id);
-   for(const [key,value]of Object.entries({BOT_TOKEN:input.token,MONGO_PASSWORD:random()}))await api('services/'+encodeURIComponent(created.uuid)+'/envs','POST',{key,value,is_literal:true,is_multiline:false,is_shown_once:true});
+   const secretEnvs=Object.entries({BOT_TOKEN:input.token,MONGO_PASSWORD:random()}).map(([key,value])=>({key,value,is_literal:true,is_multiline:false,is_shown_once:true}));
+   await api('services/'+encodeURIComponent(created.uuid)+'/envs/bulk','PATCH',{data:secretEnvs});
    await api('services/'+encodeURIComponent(created.uuid)+'/start','POST');run('UPDATE bots SET state=? WHERE id=?','starting',id);return publicBot(owned(user,id));
   }catch(e){
    if(!externalAttempted)run('DELETE FROM bots WHERE id=?',id);else run('UPDATE bots SET state=? WHERE id=?','needs_attention',id);
