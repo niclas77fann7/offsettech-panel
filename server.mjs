@@ -23,7 +23,7 @@ const query=(s,...args)=>db.prepare(s).get(...args),run=(s,...args)=>db.prepare(
 const cookie=(req,key)=>(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith(key+'='))?.slice(key.length+1);
 const session=req=>{const token=cookie(req,'__Host-offset_session');return token?query('SELECT sessions.*,users.username,users.customer FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.id=? AND expires>?',hash(token),now()):null};
 const securityHeaders={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",'Strict-Transport-Security':'max-age=31536000'};
-function send(res,status,data,extra={}){res.writeHead(status,{...securityHeaders,'Content-Type':'application/json',...extra});res.end(typeof data==='string'?data:JSON.stringify(data));}
+function send(res,status,data,extra={}){res.writeHead(status,{...securityHeaders,'Content-Type':'application/json',...extra});res.end(typeof data==='string'||Buffer.isBuffer(data)?data:JSON.stringify(data));}
 const redirect=(res,url,cookies)=>send(res,303,'',{'Location':url,...cookies?{'Set-Cookie':cookies}:{}});
 function requireSession(req){const s=session(req);if(!s)throw Object.assign(Error('Please sign in with Discord.'),{status:401});return s;}
 function csrf(req,s){if(req.headers.origin!==publicURL||!equal(req.headers['x-csrf-token'],s.csrf))throw Object.assign(Error('Invalid request. Refresh and try again.'),{status:403});}
@@ -42,12 +42,13 @@ const passwordAttempts=new Map();
 function slotAllowance(user,paid){return cfg.COMMERCE_ENABLED!=='true'&&cfg.HOSTING_TEST_DISCORD_ID===user?Math.max(1,paid):paid;}
 const rate=new Map();function limit(req,s){const key=s?.user_id||req.socket.remoteAddress;const t=Math.floor(Date.now()/60000),v=rate.get(key);if(v?.t===t&&v.n>=30)throw Object.assign(Error('Too many requests. Try again in a minute.'),{status:429});rate.set(key,{t,n:v?.t===t?v.n+1:1});if(rate.size>10000)for(const [k,x]of rate)if(x.t<t)rate.delete(k);}
 http.createServer(async(req,res)=>{try{const url=new URL(req.url,publicURL),p=url.pathname;
+ if(req.method==='GET'&&p==='/hero.jpg')return send(res,200,readFileSync(new URL('./hero.jpg',import.meta.url)),{'Content-Type':'image/jpeg','Cache-Control':'public, max-age=86400'});
  if(req.method==='GET'&&p==='/health')return send(res,200,{ok:true});
  if(req.method==='GET'&&p==='/')return send(res,200,readFileSync(new URL('./landing.html',import.meta.url)).toString(),{'Content-Type':'text/html; charset=utf-8'});
  if(req.method==='GET'&&p==='/docs')return send(res,200,readFileSync(new URL('./docs.html',import.meta.url)).toString(),{'Content-Type':'text/html; charset=utf-8'});
  if(req.method==='GET'&&p==='/signin'){if(session(req))return redirect(res,'/dashboard');return send(res,200,readFileSync(new URL('./signin.html',import.meta.url)).toString(),{'Content-Type':'text/html; charset=utf-8'});}
  if(req.method==='GET'&&['/dashboard','/staff'].includes(p)){const current=session(req);if(!current)return redirect(res,'/signin');if(p==='/staff'&&!staff.identity(current.user_id).permissions.length)return redirect(res,'/dashboard');return send(res,200,html.toString(),{'Content-Type':'text/html; charset=utf-8'});}
- if(req.method==='GET'&&['/site.css','/site.js','/signin.js','/staff-ui.js'].includes(p))return send(res,200,readFileSync(new URL('.'+p,import.meta.url)).toString(),{'Content-Type':p.endsWith('.css')?'text/css':'text/javascript'});
+ if(req.method==='GET'&&['/site.css','/workspace.css','/site.js','/signin.js','/staff-ui.js'].includes(p))return send(res,200,readFileSync(new URL('.'+p,import.meta.url)).toString(),{'Content-Type':p.endsWith('.css')?'text/css':'text/javascript'});
  if(req.method==='GET'&&p==='/api/session'){const current=session(req);return send(res,200,{user:current?{id:current.user_id,name:current.username}:null});}
  if(req.method==='POST'&&p==='/api/auth/password'){
   if(req.headers.origin!==publicURL)return send(res,403,{error:'Invalid login origin.'});
