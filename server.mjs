@@ -3,7 +3,7 @@ import { createHosting,missingHosting } from './hosting.mjs';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { random,hash,equal,validStripeSignature,slotsFromSubscriptions } from './security.mjs';
+import { random,hash,equal,validStripeSignature,slotsFromSubscriptions,stripeMode,checkoutAllowed } from './security.mjs';
 const cfg=process.env, publicURL=cfg.PUBLIC_URL?.replace(/\/$/,'');
 if(!publicURL||!publicURL.startsWith('https://'))throw Error('PUBLIC_URL must be your HTTPS origin');
 if(new URL(publicURL).origin!==publicURL)throw Error('PUBLIC_URL must contain only an origin');
@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,user_id TEXT NOT NULL RE
 CREATE TABLE IF NOT EXISTS states(id TEXT PRIMARY KEY,expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,processed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS entitlements(user_id TEXT PRIMARY KEY REFERENCES users(id),monthly INTEGER NOT NULL,yearly INTEGER NOT NULL,updated INTEGER NOT NULL);`);
+db.exec('CREATE TABLE IF NOT EXISTS stripe_test_customers(user_id TEXT PRIMARY KEY REFERENCES users(id),customer TEXT NOT NULL UNIQUE);');
+function paymentUser(user){if(cfg.STRIPE_TEST_MODE!=='true')return user;const id=user.user_id||user.id;return {...user,customer:db.prepare('SELECT customer FROM stripe_test_customers WHERE user_id=?').get(id)?.customer||null};}
 const html=readFileSync(new URL('./app.html',import.meta.url));const now=()=>Math.floor(Date.now()/1000);
 const query=(s,...args)=>db.prepare(s).get(...args),run=(s,...args)=>db.prepare(s).run(...args);
 const cookie=(req,key)=>(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith(key+'='))?.slice(key.length+1);
@@ -25,8 +27,8 @@ function requireSession(req){const s=session(req);if(!s)throw Object.assign(Erro
 function csrf(req,s){if(req.headers.origin!==publicURL||!equal(req.headers['x-csrf-token'],s.csrf))throw Object.assign(Error('Invalid request. Refresh and try again.'),{status:403});}
 function need(...keys){if(keys.some(k=>!cfg[k]))throw Object.assign(Error('This connection is not configured yet.'),{status:503});}
 async function body(req){let b=[],size=0;for await(const c of req){size+=c.length;if(size>65536)throw Object.assign(Error('Request too large'),{status:413});b.push(c);}return Buffer.concat(b);}
-async function stripe(path,params=null,key=null){need('STRIPE_SECRET_KEY');const r=await fetch('https://api.stripe.com/v1/'+path,{method:params?'POST':'GET',headers:{Authorization:'Bearer '+cfg.STRIPE_SECRET_KEY,'Stripe-Version':'2025-06-30.basil',...params?{'Content-Type':'application/x-www-form-urlencoded'}:{},...key?{'Idempotency-Key':key}:{}},body:params?new URLSearchParams(params):undefined,signal:AbortSignal.timeout(15000)});const d=await r.json();if(!r.ok)throw Error('Payment provider request failed');return d;}
-async function sync(user){if(!user.customer)return {monthly:0,yearly:0,total:0};const all=[];let after='';do{const p=new URLSearchParams({customer:user.customer,status:'all',limit:'100','expand[]':'data.latest_invoice'});if(after)p.set('starting_after',after);const result=await stripe('subscriptions?'+p);all.push(...result.data);after=result.has_more?result.data.at(-1)?.id:'';}while(after);
+async function stripe(path,params=null,key=null){need('STRIPE_SECRET_KEY');stripeMode(cfg);const r=await fetch('https://api.stripe.com/v1/'+path,{method:params?'POST':'GET',headers:{Authorization:'Bearer '+cfg.STRIPE_SECRET_KEY,'Stripe-Version':'2025-06-30.basil',...params?{'Content-Type':'application/x-www-form-urlencoded'}:{},...key?{'Idempotency-Key':key}:{}},body:params?new URLSearchParams(params):undefined,signal:AbortSignal.timeout(15000)});const d=await r.json();if(!r.ok)throw Error('Payment provider request failed');return d;}
+async function sync(user){user=paymentUser(user);if(!user.customer)return {monthly:0,yearly:0,total:0};const all=[];let after='';do{const p=new URLSearchParams({customer:user.customer,status:'all',limit:'100','expand[]':'data.latest_invoice'});if(after)p.set('starting_after',after);const result=await stripe('subscriptions?'+p);all.push(...result.data);after=result.has_more?result.data.at(-1)?.id:'';}while(after);
  const slots=slotsFromSubscriptions(all,cfg.STRIPE_MONTHLY_PRICE_ID,cfg.STRIPE_YEARLY_PRICE_ID);
  run('INSERT INTO entitlements VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET monthly=excluded.monthly,yearly=excluded.yearly,updated=excluded.updated',user.user_id||user.id,slots.monthly,slots.yearly,now());return slots;}
 // In-process serialization prevents duplicate customer creation for concurrent checkouts.
@@ -54,30 +56,30 @@ http.createServer(async(req,res)=>{try{const url=new URL(req.url,publicURL),p=ur
  }
  if(req.method==='POST'&&p==='/api/stripe/webhook'){
   need('STRIPE_WEBHOOK_SECRET');const raw=await body(req);if(!validStripeSignature(raw,req.headers['stripe-signature'],cfg.STRIPE_WEBHOOK_SECRET))return send(res,400,{error:'Invalid signature'});
-  const event=JSON.parse(raw);if(query('SELECT id FROM events WHERE id=?',event.id))return send(res,200,{received:true});
+  const event=JSON.parse(raw);if(event.livemode!==(cfg.STRIPE_TEST_MODE!=='true'))return send(res,400,{error:'Webhook mode does not match this deployment.'});if(query('SELECT id FROM events WHERE id=?',event.id))return send(res,200,{received:true});
   if(['checkout.session.completed','checkout.session.async_payment_succeeded','invoice.paid','invoice.payment_failed','customer.subscription.created','customer.subscription.updated','customer.subscription.deleted'].includes(event.type)){
    const obj=event.data.object,customer=typeof obj.customer==='string'?obj.customer:obj.customer?.id;
-   const user=customer?query('SELECT * FROM users WHERE customer=?',customer):null;
+   const user=customer?(cfg.STRIPE_TEST_MODE==='true'?query('SELECT users.* FROM users JOIN stripe_test_customers ON stripe_test_customers.user_id=users.id WHERE stripe_test_customers.customer=?',customer):query('SELECT * FROM users WHERE customer=?',customer)):null;
    if(user)await locked(user.id,async()=>{const slots=await sync(user);if(hosting.ready())await hosting.enforce(user.id,slotAllowance(user.id,slots.total));});
   }
   run('INSERT OR IGNORE INTO events VALUES(?,?)',event.id,now());return send(res,200,{received:true});
  }
  if(req.method==='GET'&&p==='/api/account'){
-  const s=session(req);if(!s)return send(res,200,{user:null,paymentsReady:!!cfg.STRIPE_SECRET_KEY});const slots=await locked(s.user_id,async()=>{const paid=await sync(s);if(hosting.ready())await hosting.enforce(s.user_id,slotAllowance(s.user_id,paid.total));await hosting.refresh(s.user_id);return paid;});return send(res,200,{user:{id:s.user_id,name:s.username},csrf:s.csrf,slots,paymentsReady:!!(cfg.STRIPE_SECRET_KEY&&cfg.STRIPE_WEBHOOK_SECRET),deploymentReady:hosting.ready(),commerceEnabled:cfg.COMMERCE_ENABLED==='true',hostingMissing:missingHosting(cfg),bots:hosting.list(s.user_id),hostingTest:cfg.COMMERCE_ENABLED!=='true'&&cfg.HOSTING_TEST_DISCORD_ID===s.user_id});
+  const s=session(req);if(!s)return send(res,200,{user:null,paymentsReady:!!cfg.STRIPE_SECRET_KEY});const slots=await locked(s.user_id,async()=>{const paid=await sync(s);if(hosting.ready())await hosting.enforce(s.user_id,slotAllowance(s.user_id,paid.total));await hosting.refresh(s.user_id);return paid;});return send(res,200,{user:{id:s.user_id,name:s.username},csrf:s.csrf,slots,paymentsReady:!!(cfg.STRIPE_SECRET_KEY&&cfg.STRIPE_WEBHOOK_SECRET),deploymentReady:hosting.ready(),commerceEnabled:checkoutAllowed(cfg,s.user_id),paymentsTestMode:cfg.STRIPE_TEST_MODE==='true',hostingMissing:missingHosting(cfg),bots:hosting.list(s.user_id),hostingTest:cfg.COMMERCE_ENABLED!=='true'&&cfg.HOSTING_TEST_DISCORD_ID===s.user_id});
  }
  if(req.method==='GET'&&p==='/api/bots/status'){
   const s=requireSession(req);limit(req,s);return await locked(s.user_id,async()=>{await hosting.refresh(s.user_id);return send(res,200,{bots:hosting.list(s.user_id)});});
  }
  if(req.method==='POST'&&p==='/api/logout'){const s=requireSession(req);csrf(req,s);run('DELETE FROM sessions WHERE id=?',s.id);return send(res,200,{ok:true},{'Set-Cookie':'__Host-offset_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'});}
  if(req.method==='POST'&&p==='/api/checkout'){
-  const s=requireSession(req);csrf(req,s);limit(req,s);if(cfg.COMMERCE_ENABLED!=='true'||!hosting.ready())return send(res,503,{error:'Checkout is not open while hosting is being connected.'});need('STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_MONTHLY_PRICE_ID','STRIPE_YEARLY_PRICE_ID');const input=JSON.parse(await body(req));
+  const s=requireSession(req);csrf(req,s);limit(req,s);if(!checkoutAllowed(cfg,s.user_id)||!hosting.ready())return send(res,503,{error:'Checkout is not open while hosting is being connected.'});need('STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_MONTHLY_PRICE_ID','STRIPE_YEARLY_PRICE_ID');const input=JSON.parse(await body(req));
   if(!['monthly','yearly'].includes(input.plan)||!Number.isInteger(input.quantity)||input.quantity<1||input.quantity>100)return send(res,400,{error:'Choose a plan and 1–100 slots.'});
   const price=input.plan==='monthly'?cfg.STRIPE_MONTHLY_PRICE_ID:cfg.STRIPE_YEARLY_PRICE_ID;
-  return await locked(s.user_id,async()=>{let user=query('SELECT * FROM users WHERE id=?',s.user_id);if(!user.customer){const c=await stripe('customers',{'metadata[discord_id]':s.user_id},'customer-'+s.user_id);run('UPDATE users SET customer=? WHERE id=?',c.id,s.user_id);user.customer=c.id;}
+  return await locked(s.user_id,async()=>{let user=paymentUser(query('SELECT * FROM users WHERE id=?',s.user_id));if(!user.customer){const c=await stripe('customers',{'metadata[discord_id]':s.user_id},'customer-'+(cfg.STRIPE_TEST_MODE==='true'?'test-':'live-')+s.user_id);if(cfg.STRIPE_TEST_MODE==='true')run('INSERT INTO stripe_test_customers VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET customer=excluded.customer',s.user_id,c.id);else run('UPDATE users SET customer=? WHERE id=?',c.id,s.user_id);user.customer=c.id;}
   const result=await stripe('checkout/sessions',{mode:'subscription',customer:user.customer,'line_items[0][price]':price,'line_items[0][quantity]':String(input.quantity),client_reference_id:s.user_id,'subscription_data[metadata][discord_id]':s.user_id,success_url:publicURL+'/?checkout=success',cancel_url:publicURL+'/?checkout=cancelled'});return send(res,200,{url:result.url});});
  }
  if(req.method==='POST'&&p==='/api/billing'){
-  const s=requireSession(req);csrf(req,s);limit(req,s);if(!s.customer)return send(res,400,{error:'No billing account yet.'});const portal=await stripe('billing_portal/sessions',{customer:s.customer,return_url:publicURL+'/'});return send(res,200,{url:portal.url});
+  const s=requireSession(req);csrf(req,s);limit(req,s);const user=paymentUser(s);if(!user.customer)return send(res,400,{error:'No billing account yet.'});const portal=await stripe('billing_portal/sessions',{customer:user.customer,return_url:publicURL+'/'});return send(res,200,{url:portal.url});
  }
  if(req.method==='POST'&&p==='/api/hosting/check'){
   const s=requireSession(req);csrf(req,s);limit(req,s);return send(res,200,await hosting.check());
