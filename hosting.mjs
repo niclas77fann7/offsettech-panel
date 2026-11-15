@@ -60,15 +60,16 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
   const base=new URL(cfg.COOLIFY_API_URL);if(!['https:','http:'].includes(base.protocol)||base.username||base.password||base.search||base.hash)throw fail(503,'Invalid Coolify API address.');
   // Address is administrator-configured only; customer input never chooses API targets.
   const r=await fetcher(base.toString().replace(/\/$/,'')+'/api/v1/'+path,{method,headers:{Authorization:'Bearer '+cfg.COOLIFY_API_TOKEN,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data),redirect:'error',signal:AbortSignal.timeout(25000)});
-  if(!r.ok)throw fail(502,`Coolify request failed (${r.status}). Check token permissions and resource access.`);
+  if(!r.ok){const error=fail(502,`Coolify request failed (${r.status}). Check token permissions and resource access.`);error.upstreamStatus=r.status;throw error;}
   if(r.status===204)return {};const raw=await r.text();try{return JSON.parse(raw)}catch{return {}};
  }
  async function refresh(user){
   const rows=db.prepare('SELECT * FROM bots WHERE user_id=?').all(user);
   await Promise.all(rows.map(async b=>{
-   if(!b.service_uuid||b.state==='suspended')return;
+   if(!b.service_uuid||['suspended','revoked','deleted'].includes(b.state))return;
    try{
     const service=await api('services/'+encodeURIComponent(b.service_uuid));
+    if(b.state==='deleting')return;
     const components=[...(service.applications||[]),...(service.databases||[])];
     const bot=components.find(app=>app.name==='bot');
     const mongo=components.find(database=>database.name==='mongo');
@@ -81,21 +82,21 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
      if(result.confirmed)run('DELETE FROM bot_operations WHERE bot_id=?',b.id);
     }
     if(current&&current!==b.state)run('UPDATE bots SET state=? WHERE id=? AND user_id=?',current,b.id,user);
-   }catch{ /* A provider outage must not invent a new status or release a reserved slot. */ }
+   }catch(error){if(error.upstreamStatus===404&&b.state==='deleting'){run('DELETE FROM bot_operations WHERE bot_id=?',b.id);run("UPDATE bots SET state='deleted',discord_bot_id=NULL WHERE id=?",b.id);}}
   }));
  }
- function publicBot(b){return{id:b.id,name:b.name,guildId:b.guild_id,status:b.state,created:b.created};}
- function list(user){return db.prepare('SELECT * FROM bots WHERE user_id=? ORDER BY created,id').all(user).map(publicBot);}
- function owned(user,id){const b=q('SELECT * FROM bots WHERE id=? AND user_id=?',id,user);if(!b)throw fail(404,'Bot not found.');return b;}
+ function publicBot(b){return{id:b.id,name:b.name,guildId:b.guild_id,status:b.state,created:b.created,ownerId:b.user_id};}
+ function list(user){return db.prepare("SELECT * FROM bots WHERE user_id=? AND state!='deleted' ORDER BY created,id").all(user).map(publicBot);}
+ function owned(user,id){const b=q("SELECT * FROM bots WHERE id=? AND user_id=? AND state!='deleted'",id,user);if(!b)throw fail(404,'Bot not found.');return b;}
  async function check(){const version=await api('version');return{connected:true,missing:missingHosting(cfg),version:typeof version==='string'?version:undefined};}
  function ready(){return !missingHosting(cfg).length&&cfg.HOSTING_ENABLED==='true';}
  async function create(user,input,slots){
   configured();if(!ready())throw fail(503,'Bot deployment is not enabled yet.');
   if(!input||typeof input.name!=='string'||!input.name.trim()||input.name.length>40||typeof input.token!=='string'||input.token.length<30||input.token.length>250||/[\r\n\s]/.test(input.token))throw fail(400,'Enter a bot name, valid bot token and Discord server ID.');
   const compose=template(input.guildId,user,cfg.MODMAIL_IMAGE,cfg.PUBLIC_URL.replace(/\/$/,'')+'/hosting-logs-unavailable');
-  if(q('SELECT count(*) AS n FROM bots WHERE user_id=?',user).n>=slots)throw fail(409,'No unused slot is available.');
+  if(q("SELECT count(*) AS n FROM bots WHERE user_id=? AND state!='deleted'",user).n>=slots)throw fail(409,'No unused slot is available.');
   const capacity=Number(cfg.MAX_BOT_INSTANCES||5);if(!Number.isSafeInteger(capacity)||capacity<1)throw fail(503,'Hosting capacity is not configured.');
-  if(q('SELECT count(*) AS n FROM bots').n>=capacity)throw fail(409,'Hosting capacity is full. Please contact support.');
+  if(q("SELECT count(*) AS n FROM bots WHERE state!='deleted'").n>=capacity)throw fail(409,'Hosting capacity is full. Please contact support.');
   const id=randomUUID();run('INSERT INTO bots VALUES(?,?,?,?,?,?,?,?)',id,user,input.name.trim(),input.guildId,null,null,'validating',now());
   let externalAttempted=false;
   try{
@@ -122,9 +123,11 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
  }
  async function control(user,id,action,slots){
   owned(user,id);await refresh(user);const b=owned(user,id);if(!['start','stop','restart'].includes(action))throw fail(400,'Unknown bot action.');if(!b.service_uuid)throw fail(409,'This deployment needs operator attention.');
+  if(['deleted','deleting'].includes(b.state))throw fail(409,'This bot is being deleted.');
+  if(b.state==='revoked')throw fail(403,'Hosting for this bot has been revoked. Contact staff.');
   if(action!=='stop'){
    if(!ready())throw fail(503,'Bot deployment is not enabled yet.');
-   const allowed=db.prepare('SELECT id FROM bots WHERE user_id=? ORDER BY created,id LIMIT ?').all(user,slots).some(x=>x.id===id);
+   const allowed=db.prepare("SELECT id FROM bots WHERE user_id=? AND state!='deleted' ORDER BY created,id LIMIT ?").all(user,slots).some(x=>x.id===id);
    if(!allowed)throw fail(403,'This bot has no active hosting slot.');
    if(['needs_attention','configuring'].includes(b.state))throw fail(409,'Contact support to complete this deployment before starting it.');
   }
@@ -134,6 +137,35 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
   run('INSERT INTO bot_operations VALUES(?,?,?,0) ON CONFLICT(bot_id) DO UPDATE SET action=excluded.action,requested=excluded.requested,transition_seen=0',id,action,now());
   run('UPDATE bots SET state=? WHERE id=?',action==='stop'?'stopping':action==='start'?'starting':'restarting',id);return publicBot(owned(user,id));
  }
- async function enforce(user,slots){const bots=db.prepare('SELECT * FROM bots WHERE user_id=? ORDER BY created,id').all(user);for(const b of bots.slice(slots)){if(b.service_uuid&&!['suspended','stopped'].includes(b.state)){await api('services/'+encodeURIComponent(b.service_uuid)+'/stop','POST');run('UPDATE bots SET state=? WHERE id=?','suspended',b.id);}}}
- return{ready,list,check,create,control,enforce,refresh};
+ async function enforce(user,slots){const bots=db.prepare("SELECT * FROM bots WHERE user_id=? AND state!='deleted' ORDER BY created,id").all(user);for(const b of bots.slice(slots)){if(b.service_uuid&&!['suspended','stopped','revoked','deleted','deleting'].includes(b.state)){await api('services/'+encodeURIComponent(b.service_uuid)+'/stop','POST');run('UPDATE bots SET state=? WHERE id=?','suspended',b.id);}}}
+
+ function find(id){const b=q("SELECT * FROM bots WHERE id=? AND state!='deleted'",id);if(!b)throw fail(404,'Bot not found.');return b;}
+ function all(){return db.prepare("SELECT * FROM bots WHERE state!='deleted' ORDER BY created DESC").all().map(publicBot);}
+ async function edit(user,id,input){
+  const b=owned(user,id);if(['deleted','deleting','revoked'].includes(b.state))throw fail(409,'This bot cannot be edited in its current state.');
+  if(typeof input.name!=='string'||!input.name.trim()||input.name.length>40||!/^\d{15,22}$/.test(input.guildId||''))throw fail(400,'Enter a bot name and valid server ID.');
+  const token=input.token||'';if(typeof token!=='string'||token.length>250||/\s/.test(token))throw fail(400,'Invalid bot token.');
+  if(token){const response=await fetcher('https://discord.com/api/v10/oauth2/applications/@me',{headers:{Authorization:'Bot '+token},signal:AbortSignal.timeout(15000)});if(!response.ok)throw fail(400,'Discord rejected the bot token.');const app=await response.json();if(app.id!==b.discord_bot_id||(app.team?.owner_user_id||app.owner?.id)!==user)throw fail(403,'Use a token for the same bot application owned by this account.');}
+  const changes=token||input.guildId!==b.guild_id;
+  if(changes){
+   if(!b.service_uuid)throw fail(409,'Complete the deployment before editing its configuration.');
+   const pending=q('SELECT * FROM bot_operations WHERE bot_id=?',id);if(pending&&now()-pending.requested<120)throw fail(409,'Wait for the current action to finish first.');
+   const compose=template(input.guildId,user,cfg.MODMAIL_IMAGE,cfg.PUBLIC_URL.replace(/\/$/,'')+'/hosting-logs-unavailable');
+   await api('services/'+encodeURIComponent(b.service_uuid),'PATCH',{docker_compose_raw:Buffer.from(compose).toString('base64'),instant_deploy:false});
+   if(token)await api('services/'+encodeURIComponent(b.service_uuid)+'/envs/bulk','PATCH',{data:[{key:'BOT_TOKEN',value:token,is_literal:true,is_shown_once:true}]});
+   run('UPDATE bots SET guild_id=? WHERE id=?',input.guildId,id);
+   if(!['stopped','suspended'].includes(b.state)){await api('services/'+encodeURIComponent(b.service_uuid)+'/restart','POST');run('UPDATE bots SET state=? WHERE id=?','restarting',id);run('INSERT INTO bot_operations VALUES(?,?,?,0) ON CONFLICT(bot_id) DO UPDATE SET action=excluded.action,requested=excluded.requested,transition_seen=0',id,'restart',now());}
+  }
+  run('UPDATE bots SET name=? WHERE id=?',input.name.trim(),id);return publicBot(owned(user,id));
+ }
+ async function revoke(id){const b=find(id);if(b.state==='deleting')throw fail(409,'This bot is being deleted.');if(b.service_uuid){try{await api('services/'+encodeURIComponent(b.service_uuid)+'/stop','POST');}catch(e){if(e.upstreamStatus!==400)throw e;const detail=await api('services/'+encodeURIComponent(b.service_uuid));const parts=[...(detail.applications||[]),...(detail.databases||[])];if(!parts.length||!parts.every(x=>['stopped','exited'].includes(String(x.status).split(':')[0])))throw e;}}
+  run('DELETE FROM bot_operations WHERE bot_id=?',id);run('UPDATE bots SET state=? WHERE id=?','revoked',id);return publicBot(find(id));}
+ function restore(id){const b=find(id);if(b.state!=='revoked')throw fail(409,'This bot has not been revoked.');run('UPDATE bots SET state=? WHERE id=?','stopped',id);return publicBot(find(id));}
+ async function remove(user,id){const b=owned(user,id);let provider=b.service_uuid;
+  if(!provider){const services=await api('services');const rows=Array.isArray(services)?services:services.data;if(!Array.isArray(rows))throw fail(502,'Unable to reconcile this deployment.');provider=rows.find(x=>x.name==='offsettech-'+id)?.uuid;}
+  if(provider){await api('services/'+encodeURIComponent(provider)+'?delete_volumes=false&docker_cleanup=false','DELETE');run('DELETE FROM bot_operations WHERE bot_id=?',id);run('UPDATE bots SET state=?,service_uuid=? WHERE id=?','deleting',provider,id);}
+  else{run('DELETE FROM bot_operations WHERE bot_id=?',id);run("UPDATE bots SET state='deleted',discord_bot_id=NULL WHERE id=?",id);}
+  return {deleted:!provider,pending:!!provider};
+ }
+ return{ready,list,check,create,control,enforce,refresh,find,all,edit,revoke,restore,remove};
 }

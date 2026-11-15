@@ -1,31 +1,39 @@
 # OffsetTech control panel
 
-Prepared backend for deployment to Contabo with Coolify. The existing ChatGPT Site is an interactive preview; this app runs separately and requires its own HTTPS origin.
+Discord bot hosting on Contabo, managed through Coolify. The Node 24 server provides a public landing page, a private dashboard, Stripe subscriptions, bot lifecycle controls and a staff console.
 
-## Implemented
+## Included
 
-- Discord authorization-code login using the identify scope, one-use state, HttpOnly secure cookies and server-side expiring sessions.
-- Monthly/yearly Stripe Checkout with server-allowlisted prices and quantity 1–100.
-- Stripe billing portal; signed webhook verification with timestamp tolerance and event deduplication.
-- Account slot totals checked against Stripe, with only paid, recognized, unexpired subscription items granting access. Cancellation at the end of the paid period retains access until that period ends.
-- SQLite persistence; use a single application replica and persistent /data storage.
-- No bot-token collection, Coolify bot provisioning or Discord slash-command handlers yet. Paid slot reduction is reflected in the account but deployment suspension is not implemented. Checkout remains disabled until these are completed.
+- Discord sign-in with one-use OAuth state and expiring secure server sessions; optional owner password sign-in configured privately at runtime.
+- Public `/` landing page, `/signin`, setup guide and authenticated `/dashboard` and `/staff` routes.
+- Stripe monthly/yearly subscriptions, quantity-based slots, billing portal, signed and deduplicated webhooks, separate sandbox customer records and paid-slot reconciliation.
+- Approved Modmail provisioning with an individual MongoDB instance, generated database password and persistent volume for each bot. Application ownership is checked against Discord before deployment.
+- Customer start, stop, restart, configuration editing and instance deletion. Provider container states are reconciled with pending actions. Deletion retains database volumes and waits for provider removal before freeing a slot.
+- Owner-controlled staff membership, granular permissions, revocation/restoration and audit history. Default staff presets cannot create staff.
+- Signed Discord HTTP interactions: private `/status`, `/start`, `/stop` and `/restart`; private dashboard links from `/deploy`, `/edit`, `/delete`, `/billing` and `/staff`.
 
-## Coolify deployment
+See [RELEASE_SETUP.md](RELEASE_SETUP.md) for owner login, staff permissions, Discord registration and the upgrade steps. See [HOSTING_SETUP.md](HOSTING_SETUP.md) for the provider configuration and runtime restrictions.
 
-1. Put the contents of this directory into a private GitHub repository.
-2. In Coolify create a new application from that repository, choosing Dockerfile build and port 3000. Add a persistent volume mounted at /data. Use one replica.
-3. Assign an HTTPS hostname. Set PUBLIC_URL to that exact origin with no trailing slash.
-4. Add variables from .env.example in Coolify. Mark DISCORD_CLIENT_SECRET, STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET as secrets. Do not commit actual .env files or keys.
-5. Discord OAuth2 redirect: PUBLIC_URL/api/auth/discord/callback. The preview Site callback previously registered must be replaced with this actual backend address.
-6. In Stripe create a webhook destination pointing to PUBLIC_URL/api/stripe/webhook. Select checkout.session.completed, checkout.session.async_payment_succeeded, invoice.paid, invoice.payment_failed, customer.subscription.created, customer.subscription.updated and customer.subscription.deleted. Put that destination's signing secret into STRIPE_WEBHOOK_SECRET.
-7. Enable the Stripe customer portal to let customers cancel at period end and manage payment methods. Configure any quantity/plan changes deliberately. Adding slots on this website creates an additional subscription.
-8. Keep COMMERCE_ENABLED=false until bot provisioning is integrated and tested. Current frontend deliberately blocks checkout too. No payment-provider secrets have been configured.
+## Deployment
 
-## Testing
+Use Coolify's Dockerfile build, port `3000`, one replica, and persistent storage mounted at `/data`. Set `PUBLIC_URL` to the exact HTTPS origin without a trailing slash. Set variables from [env.example](env.example) privately in Coolify; secrets belong in runtime environment settings, never source control.
 
-Run `npm test` on Node 24. Tests cover exact raw webhook signatures, replay timestamps, invalid signatures, paid/unpaid subscription access, unfamiliar prices and cancellation at period end.
+Discord OAuth redirect: `PUBLIC_URL/api/auth/discord/callback`.
 
-Use Stripe sandbox/test credentials and matching test price IDs first. The prefilled price IDs supplied by the owner are from their live dashboard; test mode needs separately created prices. Test Discord login, checkout, duplicate webhook delivery, payment failure, renewals, cancellation and cross-user isolation before opening checkout. This version has unit tests and a local HTTP smoke test; it has not been tested against real provider credentials.
+Stripe webhook: `PUBLIC_URL/api/stripe/webhook`, listening to:
 
-Secure sessions require HTTPS. Run behind Coolify's HTTPS proxy. Keep SQLite backed up. Do not scale to multiple replicas without replacing the local database and in-process locks.
+- `checkout.session.completed`
+- `checkout.session.async_payment_succeeded`
+- `invoice.paid`
+- `invoice.payment_failed`
+- `customer.subscription.created`
+- `customer.subscription.updated`
+- `customer.subscription.deleted`
+
+Enable Stripe's customer portal for subscription management. Use sandbox credentials and matching sandbox price IDs with `STRIPE_TEST_MODE=true`; only the configured test operator can access checkout while public commerce is closed. Keep `COMMERCE_ENABLED=false` until the full lifecycle, billing failures and cancellation behavior have been checked.
+
+Secure cookies require HTTPS through the Coolify proxy. SQLite and in-process locks require a single replica. Back up `/data` and customer databases separately.
+
+## Verification
+
+Run `npm test` with Node 24. The suite covers actual HTTP authentication and route protection, CSRF, staff delegation, provider operations using mocked APIs, Discord request signatures and Stripe entitlements. New provider edit/deletion and Discord registration features need private live checks after the upgrade. Private thread-log viewing and automated recovery of retained database volumes are not included.

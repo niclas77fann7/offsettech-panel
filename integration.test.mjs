@@ -1,0 +1,24 @@
+import{test}from'node:test';import assert from'node:assert/strict';import{spawn}from'node:child_process';import{mkdtempSync,rmSync}from'node:fs';import{tmpdir}from'node:os';import{join}from'node:path';import{createHash,generateKeyPairSync,sign}from'node:crypto';import{DatabaseSync}from'node:sqlite';import net from'node:net';
+test('HTTP auth, staff permissions, CSRF and Discord ping work end to end',async t=>{
+ const dir=mkdtempSync(join(tmpdir(),'offsettech-test-'));const dbPath=join(dir,'test.sqlite');const owner='111111111111111111',customer='333333333333333333';
+ const{publicKey,privateKey}=generateKeyPairSync('ed25519');const key=publicKey.export({format:'der',type:'spki'}).subarray(-32).toString('hex');
+ const socket=net.createServer();await new Promise(r=>socket.listen(0,'127.0.0.1',r));const port=socket.address().port;await new Promise(r=>socket.close(r));
+ const child=spawn(process.execPath,['server.mjs'],{cwd:process.cwd(),env:{...process.env,PUBLIC_URL:'https://panel.example',PORT:String(port),DB_PATH:dbPath,OWNER_DISCORD_ID:owner,STAFF_OWNER_USERNAME:'test-owner',STAFF_OWNER_PASSWORD:'synthetic-test-password',DISCORD_CLIENT_ID:'test-app',DISCORD_PUBLIC_KEY:key,STRIPE_SECRET_KEY:'',COOLIFY_API_TOKEN:''},stdio:['ignore','pipe','pipe']});
+ t.after(async()=>{child.kill();await new Promise(r=>child.once('exit',r));rmSync(dir,{recursive:true,force:true});});
+ const base='http://127.0.0.1:'+port;for(let i=0;i<50;i++){try{if((await fetch(base+'/health')).ok)break;}catch{}await new Promise(r=>setTimeout(r,50));}
+ const request=(path,options={})=>fetch(base+path,{redirect:'manual',...options});
+ assert.match(await(await request('/')).text(),/Discord bot hosting/);assert.equal((await request('/dashboard')).status,303);assert.equal((await request('/staff')).status,303);assert.equal((await request('/api/staff')).status,401);
+ assert.equal((await request('/api/auth/password',{method:'POST',body:JSON.stringify({username:'test-owner',password:'synthetic-test-password'})})).status,403);
+ const login=await request('/api/auth/password',{method:'POST',headers:{Origin:'https://panel.example','Content-Type':'application/json'},body:JSON.stringify({username:'test-owner',password:'synthetic-test-password'})});assert.equal(login.status,200);const cookie=login.headers.get('set-cookie').split(';')[0];
+ const account=await(await request('/api/account',{headers:{Cookie:cookie}})).json();assert.equal(account.staff.owner,true);assert.equal((await request('/dashboard',{headers:{Cookie:cookie}})).status,200);
+ const headers={Cookie:cookie,Origin:'https://panel.example','Content-Type':'application/json','X-CSRF-Token':account.csrf};
+ assert.equal((await request('/api/staff/members',{method:'POST',headers:{Cookie:cookie,Origin:'https://panel.example'},body:'{}'})).status,403);
+ const add=await request('/api/staff/members',{method:'POST',headers,body:JSON.stringify({userId:customer,role:'support'})});assert.equal(add.status,200);
+ const db=new DatabaseSync(dbPath);db.prepare('INSERT INTO users(id,username) VALUES(?,?)').run(customer,'Customer');const sid='synthetic-session';db.prepare('INSERT INTO sessions VALUES(?,?,?,?)').run(createHash('sha256').update(sid).digest('hex'),customer,'customer-csrf',Math.floor(Date.now()/1000)+1000);db.close();
+ const limited={Cookie:'__Host-offset_session='+sid,Origin:'https://panel.example','Content-Type':'application/json','X-CSRF-Token':'customer-csrf'};
+ assert.equal((await request('/api/staff',{headers:limited})).status,200);assert.equal((await request('/api/staff/members',{method:'POST',headers:limited,body:JSON.stringify({userId:'444444444444444444',role:'admin'})})).status,403);
+ assert.equal((await request('/api/staff/discord/register',{method:'POST',headers:limited,body:'{}'})).status,403);
+ for(const [method,path]of [['PATCH','/api/staff/bots/abc'],['DELETE','/api/staff/bots/abc'],['POST','/api/staff/bots/abc/revoke']])assert.equal((await request(path,{method,headers:limited,body:'{}'})).status,403);
+ assert.equal((await request('/api/staff/members/'+customer,{method:'DELETE',headers})).status,200);assert.equal((await request('/api/staff',{headers:limited})).status,403);assert.equal((await request('/staff',{headers:limited})).status,303);
+ const raw=Buffer.from(JSON.stringify({type:1,application_id:'test-app'}));const time=String(Math.floor(Date.now()/1000));const signature=sign(null,Buffer.concat([Buffer.from(time),raw]),privateKey).toString('hex');const ping=await request('/api/discord/interactions',{method:'POST',headers:{'X-Signature-Ed25519':signature,'X-Signature-Timestamp':time},body:raw});assert.deepEqual(await ping.json(),{type:1});assert.equal((await request('/api/discord/interactions',{method:'POST',body:raw})).status,401);
+});
