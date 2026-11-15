@@ -27,6 +27,20 @@ export function template(guild,owner,image,logURL){
  // JSON is valid YAML. Credentials are referenced, never embedded in Compose.
  return JSON.stringify({services:{bot:{image,command:['python','-c',hostedBootstrap],restart:'unless-stopped',environment:{TOKEN:'${BOT_TOKEN}',GUILD_ID:guild,OWNERS:owner,CONNECTION_URI:'mongodb://offset:${MONGO_PASSWORD}@mongo:27017/modmail?authSource=admin',LOG_URL:logURL,DISABLE_AUTOUPDATES:'true',ENABLE_EVAL:'false'},depends_on:{mongo:{condition:'service_healthy'}},mem_limit:'384m',cpus:.5,pids_limit:128,cap_drop:['ALL'],security_opt:['no-new-privileges:true'],networks:['private','outbound']},mongo:{image:'mongo:7',user:'999:999',restart:'unless-stopped',environment:{MONGO_INITDB_ROOT_USERNAME:'offset',MONGO_INITDB_ROOT_PASSWORD:'${MONGO_PASSWORD}'},volumes:['database:/data/db'],healthcheck:{test:['CMD','mongosh','--quiet','--eval','db.adminCommand("ping").ok'],interval:'10s',timeout:'5s',retries:12},mem_limit:'384m',cpus:.5,pids_limit:128,cap_drop:['ALL'],security_opt:['no-new-privileges:true'],networks:['private']}},volumes:{database:{}},networks:{private:{internal:true},outbound:{}}});
 }
+// These are observed container states, not proof of a Discord Gateway connection.
+export function observedState(bot,mongo,previous){
+ if(typeof bot!=='string')return null;
+ const running=status=>typeof status==='string'&&status.split(':')[0]==='running'&&!status.includes('unhealthy');
+ if(running(bot)&&running(mongo)){
+  // Stop/restart requests can be queued while Coolify still reports the old running container.
+  return previous==='stopped'?'stopped':'running';
+ }
+ if(bot.includes('unhealthy')||(typeof mongo==='string'&&mongo.includes('unhealthy')))return 'needs_attention';
+ if(['exited','stopped'].includes(bot.split(':')[0])){
+  return ['needs_attention','configuring','starting','restarting'].includes(previous)?previous:'stopped';
+ }
+ return null;
+}
 export function createHosting({cfg,db,random,now,fetcher=fetch}){
  db.exec(`CREATE TABLE IF NOT EXISTS bots(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,guild_id TEXT NOT NULL,discord_bot_id TEXT UNIQUE,service_uuid TEXT UNIQUE,state TEXT NOT NULL,created INTEGER NOT NULL);`);
  const q=(sql,...a)=>db.prepare(sql).get(...a),run=(sql,...a)=>db.prepare(sql).run(...a);
@@ -38,6 +52,19 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
   const r=await fetcher(base.toString().replace(/\/$/,'')+'/api/v1/'+path,{method,headers:{Authorization:'Bearer '+cfg.COOLIFY_API_TOKEN,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data),redirect:'error',signal:AbortSignal.timeout(25000)});
   if(!r.ok)throw fail(502,`Coolify request failed (${r.status}). Check token permissions and resource access.`);
   if(r.status===204)return {};const raw=await r.text();try{return JSON.parse(raw)}catch{return {}};
+ }
+ async function refresh(user){
+  const rows=db.prepare('SELECT * FROM bots WHERE user_id=?').all(user);
+  await Promise.all(rows.map(async b=>{
+   if(!b.service_uuid||b.state==='suspended')return;
+   try{
+    const service=await api('services/'+encodeURIComponent(b.service_uuid));
+    const bot=service.applications?.find(app=>app.name==='bot');
+    const mongo=service.databases?.find(database=>database.name==='mongo');
+    const current=observedState(bot?.status,mongo?.status,b.state);
+    if(current&&current!==b.state)run('UPDATE bots SET state=? WHERE id=? AND user_id=?',current,b.id,user);
+   }catch{ /* A provider outage must not invent a new status or release a reserved slot. */ }
+  }));
  }
  function publicBot(b){return{id:b.id,name:b.name,guildId:b.guild_id,status:b.state,created:b.created};}
  function list(user){return db.prepare('SELECT * FROM bots WHERE user_id=? ORDER BY created,id').all(user).map(publicBot);}
@@ -76,7 +103,7 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
   }
  }
  async function control(user,id,action,slots){
-  const b=owned(user,id);if(!['start','stop','restart'].includes(action))throw fail(400,'Unknown bot action.');if(!b.service_uuid)throw fail(409,'This deployment needs operator attention.');
+  owned(user,id);await refresh(user);const b=owned(user,id);if(!['start','stop','restart'].includes(action))throw fail(400,'Unknown bot action.');if(!b.service_uuid)throw fail(409,'This deployment needs operator attention.');
   if(action!=='stop'){
    if(!ready())throw fail(503,'Bot deployment is not enabled yet.');
    const allowed=db.prepare('SELECT id FROM bots WHERE user_id=? ORDER BY created,id LIMIT ?').all(user,slots).some(x=>x.id===id);
@@ -86,5 +113,5 @@ export function createHosting({cfg,db,random,now,fetcher=fetch}){
   await api('services/'+encodeURIComponent(b.service_uuid)+'/'+action,'POST');run('UPDATE bots SET state=? WHERE id=?',action==='stop'?'stopped':action==='start'?'starting':'restarting',id);return publicBot(owned(user,id));
  }
  async function enforce(user,slots){const bots=db.prepare('SELECT * FROM bots WHERE user_id=? ORDER BY created,id').all(user);for(const b of bots.slice(slots)){if(b.service_uuid&&!['suspended','stopped'].includes(b.state)){await api('services/'+encodeURIComponent(b.service_uuid)+'/stop','POST');run('UPDATE bots SET state=? WHERE id=?','suspended',b.id);}}}
- return{ready,list,check,create,control,enforce};
+ return{ready,list,check,create,control,enforce,refresh};
 }
