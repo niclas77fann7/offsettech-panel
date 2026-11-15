@@ -1,0 +1,6 @@
+.env
+.env.*
+*.sqlite*
+.git
+*.test.mjs
+node_modules

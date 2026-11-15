@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { createHosting,missingHosting } from './hosting.mjs';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -30,6 +31,8 @@ async function sync(user){if(!user.customer)return {monthly:0,yearly:0,total:0};
  run('INSERT INTO entitlements VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET monthly=excluded.monthly,yearly=excluded.yearly,updated=excluded.updated',user.user_id||user.id,slots.monthly,slots.yearly,now());return slots;}
 // In-process serialization prevents duplicate customer creation for concurrent checkouts.
 const locks=new Map();async function locked(key,fn){const previous=locks.get(key)||Promise.resolve();const next=previous.catch(()=>{}).then(fn);locks.set(key,next);try{return await next;}finally{if(locks.get(key)===next)locks.delete(key);}}
+const hosting=createHosting({cfg,db,random,now});
+function slotAllowance(user,paid){return cfg.COMMERCE_ENABLED!=='true'&&cfg.HOSTING_TEST_DISCORD_ID===user?Math.max(1,paid):paid;}
 const rate=new Map();function limit(req,s){const key=s?.user_id||req.socket.remoteAddress;const t=Math.floor(Date.now()/60000),v=rate.get(key);if(v?.t===t&&v.n>=30)throw Object.assign(Error('Too many requests. Try again in a minute.'),{status:429});rate.set(key,{t,n:v?.t===t?v.n+1:1});if(rate.size>10000)for(const [k,x]of rate)if(x.t<t)rate.delete(k);}
 http.createServer(async(req,res)=>{try{const url=new URL(req.url,publicURL),p=url.pathname;
  if(req.method==='GET'&&p==='/health')return send(res,200,{ok:true});
@@ -55,16 +58,16 @@ http.createServer(async(req,res)=>{try{const url=new URL(req.url,publicURL),p=ur
   if(['checkout.session.completed','checkout.session.async_payment_succeeded','invoice.paid','invoice.payment_failed','customer.subscription.created','customer.subscription.updated','customer.subscription.deleted'].includes(event.type)){
    const obj=event.data.object,customer=typeof obj.customer==='string'?obj.customer:obj.customer?.id;
    const user=customer?query('SELECT * FROM users WHERE customer=?',customer):null;
-   if(user)await locked(user.id,()=>sync(user));
+   if(user)await locked(user.id,async()=>{const slots=await sync(user);if(hosting.ready())await hosting.enforce(user.id,slotAllowance(user.id,slots.total));});
   }
   run('INSERT OR IGNORE INTO events VALUES(?,?)',event.id,now());return send(res,200,{received:true});
  }
  if(req.method==='GET'&&p==='/api/account'){
-  const s=session(req);if(!s)return send(res,200,{user:null,paymentsReady:!!cfg.STRIPE_SECRET_KEY});const slots=await locked(s.user_id,()=>sync(s));return send(res,200,{user:{id:s.user_id,name:s.username},csrf:s.csrf,slots,paymentsReady:!!(cfg.STRIPE_SECRET_KEY&&cfg.STRIPE_WEBHOOK_SECRET),deploymentReady:false});
+  const s=session(req);if(!s)return send(res,200,{user:null,paymentsReady:!!cfg.STRIPE_SECRET_KEY});const slots=await locked(s.user_id,async()=>{const paid=await sync(s);if(hosting.ready())await hosting.enforce(s.user_id,slotAllowance(s.user_id,paid.total));return paid;});return send(res,200,{user:{id:s.user_id,name:s.username},csrf:s.csrf,slots,paymentsReady:!!(cfg.STRIPE_SECRET_KEY&&cfg.STRIPE_WEBHOOK_SECRET),deploymentReady:hosting.ready(),commerceEnabled:cfg.COMMERCE_ENABLED==='true',hostingMissing:missingHosting(cfg),bots:hosting.list(s.user_id),hostingTest:cfg.COMMERCE_ENABLED!=='true'&&cfg.HOSTING_TEST_DISCORD_ID===s.user_id});
  }
  if(req.method==='POST'&&p==='/api/logout'){const s=requireSession(req);csrf(req,s);run('DELETE FROM sessions WHERE id=?',s.id);return send(res,200,{ok:true},{'Set-Cookie':'__Host-offset_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'});}
  if(req.method==='POST'&&p==='/api/checkout'){
-  const s=requireSession(req);csrf(req,s);limit(req,s);if(cfg.COMMERCE_ENABLED!=='true')return send(res,503,{error:'Checkout is not open while hosting is being connected.'});need('STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_MONTHLY_PRICE_ID','STRIPE_YEARLY_PRICE_ID');const input=JSON.parse(await body(req));
+  const s=requireSession(req);csrf(req,s);limit(req,s);if(cfg.COMMERCE_ENABLED!=='true'||!hosting.ready())return send(res,503,{error:'Checkout is not open while hosting is being connected.'});need('STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_MONTHLY_PRICE_ID','STRIPE_YEARLY_PRICE_ID');const input=JSON.parse(await body(req));
   if(!['monthly','yearly'].includes(input.plan)||!Number.isInteger(input.quantity)||input.quantity<1||input.quantity>100)return send(res,400,{error:'Choose a plan and 1–100 slots.'});
   const price=input.plan==='monthly'?cfg.STRIPE_MONTHLY_PRICE_ID:cfg.STRIPE_YEARLY_PRICE_ID;
   return await locked(s.user_id,async()=>{let user=query('SELECT * FROM users WHERE id=?',s.user_id);if(!user.customer){const c=await stripe('customers',{'metadata[discord_id]':s.user_id},'customer-'+s.user_id);run('UPDATE users SET customer=? WHERE id=?',c.id,s.user_id);user.customer=c.id;}
@@ -73,5 +76,22 @@ http.createServer(async(req,res)=>{try{const url=new URL(req.url,publicURL),p=ur
  if(req.method==='POST'&&p==='/api/billing'){
   const s=requireSession(req);csrf(req,s);limit(req,s);if(!s.customer)return send(res,400,{error:'No billing account yet.'});const portal=await stripe('billing_portal/sessions',{customer:s.customer,return_url:publicURL+'/'});return send(res,200,{url:portal.url});
  }
+ if(req.method==='POST'&&p==='/api/hosting/check'){
+  const s=requireSession(req);csrf(req,s);limit(req,s);return send(res,200,await hosting.check());
+ }
+ if(req.method==='POST'&&p==='/api/bots'){
+  const s=requireSession(req);csrf(req,s);limit(req,s);const input=JSON.parse(await body(req));
+  return await locked(s.user_id,async()=>{const paid=await sync(s);const result=await hosting.create(s.user_id,input,slotAllowance(s.user_id,paid.total));return send(res,201,{bot:result});});
+ }
+ const actionMatch=p.match(/^\/api\/bots\/([a-f0-9-]+)\/(start|stop|restart)$/);
+ if(req.method==='POST'&&actionMatch){
+  const s=requireSession(req);csrf(req,s);limit(req,s);return await locked(s.user_id,async()=>{const paid=await sync(s);const result=await hosting.control(s.user_id,actionMatch[1],actionMatch[2],slotAllowance(s.user_id,paid.total));return send(res,200,{bot:result});});
+ }
+ if(req.method==='GET'&&p==='/hosting-logs-unavailable')return send(res,501,'Log viewing is not included in this hosting test. Threads are stored in the bot database.',{'Content-Type':'text/plain'});
  return send(res,404,{error:'Not found'});
  }catch(e){const status=e.status||502;console.error('Request failed:',status);return send(res,status,{error:e.status?e.message:'Connection failed. Please try again.'});}}).listen(Number(cfg.PORT||3000),'0.0.0.0',()=>console.log('OffsetTech listening on configured port'));
+
+
+// Reconcile renewals/expiry even when the customer does not open the site or a webhook is missed.
+let sweeping=false;
+setInterval(async()=>{if(sweeping||!hosting.ready())return;sweeping=true;try{for(const user of db.prepare('SELECT DISTINCT users.* FROM users JOIN bots ON users.id=bots.user_id').all()){try{await locked(user.id,async()=>{const slots=await sync(user);await hosting.enforce(user.id,slotAllowance(user.id,slots.total));});}catch{console.error('Hosting reconciliation needs attention');}}}finally{sweeping=false;}},300000).unref();
